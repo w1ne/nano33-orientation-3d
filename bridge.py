@@ -42,9 +42,16 @@ def find_port(preferred: str | None) -> str | None:
     return None
 
 
-def serial_reader(port: str, baud: float, loop: asyncio.AbstractEventLoop):
-    """Blocking serial read loop, run in a background thread."""
+def serial_reader(preferred: str, baud: float, loop: asyncio.AbstractEventLoop):
+    """Blocking serial read loop, run in a background thread.
+    Re-detects the port on every (re)connect so the board can re-enumerate
+    (replug / move to a different /dev/ttyACMx) without restarting the bridge."""
+    import time
     while True:
+        port = find_port(preferred)
+        if not port:
+            print("[serial] no Arduino port found -- retrying in 2s")
+            time.sleep(2); continue
         try:
             with serial.Serial(port, baud, timeout=1) as ser:
                 print(f"[serial] connected to {port} @ {baud}")
@@ -68,8 +75,7 @@ def serial_reader(port: str, baud: float, loop: asyncio.AbstractEventLoop):
                     asyncio.run_coroutine_threadsafe(broadcast(msg), loop)
         except serial.SerialException as e:
             latest["connected"] = False
-            print(f"[serial] {e} -- retrying in 2s")
-            import time
+            print(f"[serial] {e} -- re-detecting in 2s")
             time.sleep(2)
 
 
@@ -109,14 +115,11 @@ async def main():
     ap.add_argument("--baud", type=int, default=115200)
     args = ap.parse_args()
 
-    port = find_port(args.port)
-    if not port:
-        print("[serial] no Arduino port found; pass --port /dev/ttyACMx")
     loop = asyncio.get_running_loop()
-
     threading.Thread(target=start_http, daemon=True).start()
-    if port:
-        threading.Thread(target=serial_reader, args=(port, args.baud, loop), daemon=True).start()
+    # Pass the preference (None = auto-detect); serial_reader re-resolves the
+    # actual port on every connect, so the board can re-enumerate freely.
+    threading.Thread(target=serial_reader, args=(args.port, args.baud, loop), daemon=True).start()
 
     async with websockets.serve(ws_handler, "", WS_PORT):
         print(f"[ws] listening on ws://localhost:{WS_PORT}")
