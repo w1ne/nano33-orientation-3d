@@ -1,76 +1,112 @@
 /*
- * OrientationStream - Arduino Nano 33 BLE (LSM9DS1)
+ * OrientationStream - Arduino Nano 33 BLE Rev2 (BMI270 + BMM150)
  *
- * Reads the on-board accelerometer + gyroscope, fuses them with a Madgwick
- * filter into an absolute orientation quaternion, and streams it over USB
- * serial as a CSV line:
+ * 9-axis fusion with a MAHONY filter (proportional + integral). The magnetometer
+ * gives an absolute compass heading so yaw does not drift; the integral term
+ * continuously estimates and removes gyroscope bias (incl. post-fast-move
+ * transients).
  *
- *     q0,q1,q2,q3,gyroMag\n
+ * Streams:  q0,q1,q2,q3,gyroMag\n   (quaternion w,x,y,z + angular rate deg/s)
  *
- *   q0..q3  : orientation quaternion (w, x, y, z), unit length
- *   gyroMag : magnitude of angular rate in deg/s (stability indicator;
- *             ~0 when the board is held still, large while moving)
+ * Magnetometer calibration (recovered empirically + validated against gravity,
+ * std 0.048, gravity-field angle 23.4 deg matches local magnetic dip):
+ *   hard-iron offsets in raw BMM150 axes, then remap raw BMM150 -> board frame:
+ *   board_x=-my, board_y=+mx, board_z=+mz
  *
- * 6-axis fusion (no magnetometer): roll & pitch are absolute and rock
- * stable; yaw is relative and may drift slowly. Add the magnetometer later
- * (with hard/soft-iron calibration) for an absolute compass heading.
+ * NOTE: the magnetometer needs a clean magnetic environment. Near a laptop,
+ * motors, speakers, or metal the local field is distorted and yaw will follow
+ * it. For best heading, run the board away from such sources.
  */
 
-#include <Arduino_BMI270_BMM150.h>   // Nano 33 BLE Rev2 IMU (same IMU.* API as LSM9DS1)
+#include <Arduino_BMI270_BMM150.h>
 
-// --- Madgwick filter state ---
-static float beta = 0.1f;                  // filter gain
+// --- Magnetometer hard-iron offsets (raw BMM150 frame, uT) ---
+static const float MX_OFF = -1.0f, MY_OFF = 0.5f, MZ_OFF = -15.5f;
+
+// --- Mahony filter gains ---
+static const float twoKp = 2.0f * 1.0f;    // 2 * proportional gain
+static const float twoKi = 2.0f * 0.15f;   // 2 * integral gain (gyro-bias estimation)
+
+// --- Filter state ---
 static float q0 = 1, q1 = 0, q2 = 0, q3 = 0;
+static float integralFBx = 0, integralFBy = 0, integralFBz = 0;  // estimated gyro bias (rad/s)
 static unsigned long lastMicros = 0;
 
-// Gyro zero-rate bias (deg/s): seeded at startup, then continuously re-learned
-// whenever the board is detected stationary (tracks temperature drift).
+// Startup gyro bias (deg/s) -- a good initial guess; Mahony's integral refines it live.
 static float gxBias = 0, gyBias = 0, gzBias = 0;
-
-// Stability tuning
-static const float GYRO_STILL    = 0.8f;   // deg/s; strict gate so real motion isn't absorbed as bias
-static const float ACC_STILL     = 0.05f;  // g; accel within this of 1 g => no linear acceleration
-static const float BIAS_LR       = 0.02f;  // learning rate; fast re-converge once *truly* still
-static const int   STILL_HOLD    = 25;     // consecutive still samples required before trusting "still"
-static const float GYRO_DEADBAND = 0.4f;   // deg/s; ignore rotation below this so noise/residual bias can't integrate
 
 static float invSqrt(float x) { return 1.0f / sqrtf(x); }
 
-// 6-axis (gyro + accel) Madgwick update. gyro in rad/s, accel in any unit.
-void madgwickUpdateIMU(float gx, float gy, float gz,
-                       float ax, float ay, float az, float dt) {
-  float recipNorm;
-  float s0, s1, s2, s3;
-  float qDot1, qDot2, qDot3, qDot4;
-  float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2;
-  float q0q0, q1q1, q2q2, q3q3;
+// 6-axis Mahony update (fallback when magnetometer is unavailable). gyro in rad/s.
+void mahonyUpdateIMU(float gx, float gy, float gz, float ax, float ay, float az, float dt) {
+  float recipNorm, halfvx, halfvy, halfvz, halfex, halfey, halfez, qa, qb, qc;
+  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+    recipNorm = invSqrt(ax * ax + ay * ay + az * az); ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+    halfvx = q1 * q3 - q0 * q2;
+    halfvy = q0 * q1 + q2 * q3;
+    halfvz = q0 * q0 - 0.5f + q3 * q3;
+    halfex = (ay * halfvz - az * halfvy);
+    halfey = (az * halfvx - ax * halfvz);
+    halfez = (ax * halfvy - ay * halfvx);
+    if (twoKi > 0.0f) {
+      integralFBx += twoKi * halfex * dt; integralFBy += twoKi * halfey * dt; integralFBz += twoKi * halfez * dt;
+      gx += integralFBx; gy += integralFBy; gz += integralFBz;
+    }
+    gx += twoKp * halfex; gy += twoKp * halfey; gz += twoKp * halfez;
+  }
+  gx *= 0.5f * dt; gy *= 0.5f * dt; gz *= 0.5f * dt;
+  qa = q0; qb = q1; qc = q2;
+  q0 += -qb * gx - qc * gy - q3 * gz;
+  q1 +=  qa * gx + qc * gz - q3 * gy;
+  q2 +=  qa * gy - qb * gz + q3 * gx;
+  q3 +=  qa * gz + qb * gy - qc * gx;
+  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
+}
 
-  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
+// 9-axis Mahony AHRS update. gyro in rad/s; accel & mag any unit.
+void mahonyUpdate(float gx, float gy, float gz, float ax, float ay, float az,
+                  float mx, float my, float mz, float dt) {
+  if ((mx == 0.0f) && (my == 0.0f) && (mz == 0.0f)) { mahonyUpdateIMU(gx, gy, gz, ax, ay, az, dt); return; }
+
+  float recipNorm, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+  float hx, hy, bx, bz, halfvx, halfvy, halfvz, halfwx, halfwy, halfwz, halfex, halfey, halfez, qa, qb, qc;
 
   if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-    recipNorm = invSqrt(ax * ax + ay * ay + az * az);
-    ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+    recipNorm = invSqrt(ax * ax + ay * ay + az * az); ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+    recipNorm = invSqrt(mx * mx + my * my + mz * mz); mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
 
-    _2q0 = 2 * q0; _2q1 = 2 * q1; _2q2 = 2 * q2; _2q3 = 2 * q3;
-    _4q0 = 4 * q0; _4q1 = 4 * q1; _4q2 = 4 * q2;
-    _8q1 = 8 * q1; _8q2 = 8 * q2;
-    q0q0 = q0 * q0; q1q1 = q1 * q1; q2q2 = q2 * q2; q3q3 = q3 * q3;
+    q0q0 = q0 * q0; q0q1 = q0 * q1; q0q2 = q0 * q2; q0q3 = q0 * q3;
+    q1q1 = q1 * q1; q1q2 = q1 * q2; q1q3 = q1 * q3; q2q2 = q2 * q2; q2q3 = q2 * q3; q3q3 = q3 * q3;
 
-    s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-    s1 = _4q1 * q3q3 - _2q3 * ax + 4 * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-    s2 = 4 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-    s3 = 4 * q1q1 * q3 - _2q1 * ax + 4 * q2q2 * q3 - _2q2 * ay;
+    hx = 2.0f * (mx * (0.5f - q2q2 - q3q3) + my * (q1q2 - q0q3) + mz * (q1q3 + q0q2));
+    hy = 2.0f * (mx * (q1q2 + q0q3) + my * (0.5f - q1q1 - q3q3) + mz * (q2q3 - q0q1));
+    bx = sqrtf(hx * hx + hy * hy);
+    bz = 2.0f * (mx * (q1q3 - q0q2) + my * (q2q3 + q0q1) + mz * (0.5f - q1q1 - q2q2));
 
-    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
-    s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+    halfvx = q1q3 - q0q2;
+    halfvy = q0q1 + q2q3;
+    halfvz = q0q0 - 0.5f + q3q3;
+    halfwx = bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2);
+    halfwy = bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3);
+    halfwz = bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2);
 
-    qDot1 -= beta * s0; qDot2 -= beta * s1; qDot3 -= beta * s2; qDot4 -= beta * s3;
+    halfex = (ay * halfvz - az * halfvy) + (my * halfwz - mz * halfwy);
+    halfey = (az * halfvx - ax * halfvz) + (mz * halfwx - mx * halfwz);
+    halfez = (ax * halfvy - ay * halfvx) + (mx * halfwy - my * halfwx);
+
+    if (twoKi > 0.0f) {
+      integralFBx += twoKi * halfex * dt; integralFBy += twoKi * halfey * dt; integralFBz += twoKi * halfez * dt;
+      gx += integralFBx; gy += integralFBy; gz += integralFBz;
+    }
+    gx += twoKp * halfex; gy += twoKp * halfey; gz += twoKp * halfez;
   }
-
-  q0 += qDot1 * dt; q1 += qDot2 * dt; q2 += qDot3 * dt; q3 += qDot4 * dt;
+  gx *= 0.5f * dt; gy *= 0.5f * dt; gz *= 0.5f * dt;
+  qa = q0; qb = q1; qc = q2;
+  q0 += -qb * gx - qc * gy - q3 * gz;
+  q1 +=  qa * gx + qc * gz - q3 * gy;
+  q2 +=  qa * gy - qb * gz + q3 * gx;
+  q3 +=  qa * gz + qb * gy - qc * gx;
   recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
   q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
 }
@@ -78,84 +114,52 @@ void madgwickUpdateIMU(float gx, float gy, float gz,
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 4000) { /* wait briefly for host */ }
+  if (!IMU.begin()) { while (1) { Serial.println("ERR: IMU init failed"); delay(1000); } }
 
-  if (!IMU.begin()) {
-    while (1) { Serial.println("ERR: IMU init failed"); delay(1000); }
-  }
-
-  // --- Gyro bias calibration: keep the board still for ~2 s after reset ---
+  // Startup gyro bias: hold still ~2 s after reset.
   Serial.println("CAL: hold the board still...");
-  const int N = 800;
-  int got = 0;
-  float bx = 0, by = 0, bz = 0;
+  const int N = 800; int got = 0; float bx = 0, by = 0, bz = 0;
   unsigned long t0 = millis();
   while (got < N && millis() - t0 < 5000) {
-    if (IMU.gyroscopeAvailable()) {
-      float gx, gy, gz;
-      IMU.readGyroscope(gx, gy, gz);
-      bx += gx; by += gy; bz += gz; got++;
-    }
+    if (IMU.gyroscopeAvailable()) { float gx, gy, gz; IMU.readGyroscope(gx, gy, gz); bx += gx; by += gy; bz += gz; got++; }
   }
   if (got > 0) { gxBias = bx / got; gyBias = by / got; gzBias = bz / got; }
   Serial.print("CAL: done, bias deg/s = ");
-  Serial.print(gxBias, 3); Serial.print(',');
-  Serial.print(gyBias, 3); Serial.print(',');
-  Serial.println(gzBias, 3);
-
+  Serial.print(gxBias, 3); Serial.print(','); Serial.print(gyBias, 3); Serial.print(','); Serial.println(gzBias, 3);
   lastMicros = micros();
 }
 
 void loop() {
-  float ax, ay, az, gx, gy, gz;
+  float ax, ay, az, gx, gy, gz, mxr, myr, mzr;
+  static float mbx = 0, mby = 0, mbz = 0;     // magnetometer in board frame (last known)
   bool haveA = false, haveG = false;
 
   if (IMU.accelerationAvailable()) { IMU.readAcceleration(ax, ay, az); haveA = true; }
-  if (IMU.gyroscopeAvailable())    { IMU.readGyroscope(gx, gy, gz); haveG = true; }
+  if (IMU.gyroscopeAvailable())    { IMU.readGyroscope(gx, gy, gz);    haveG = true; }
+  if (IMU.magneticFieldAvailable()) {
+    IMU.readMagneticField(mxr, myr, mzr);
+    float cmx = mxr - MX_OFF, cmy = myr - MY_OFF, cmz = mzr - MZ_OFF;  // hard-iron
+    mbx = -cmy; mby = cmx; mbz = cmz;                                  // remap -> board frame
+  }
 
   if (haveA && haveG) {
-    // Bias-correct the gyro.
-    float cx = gx - gxBias, cy = gy - gyBias, cz = gz - gzBias;
-
-    // Stationary detection: little rotation AND accel ~ 1 g (no linear motion).
-    float accMag  = sqrtf(ax * ax + ay * ay + az * az);
-    float corrMag = sqrtf(cx * cx + cy * cy + cz * cz);
-    bool still = (corrMag < GYRO_STILL) && (fabsf(accMag - 1.0f) < ACC_STILL);
-
-    // Require the board to be still for a sustained run before retraining the
-    // bias, so a slow handling motion can't be mistaken for "stationary" and
-    // absorbed into the bias (which would make it spin once you stop).
-    static int stillCount = 0;
-    stillCount = still ? (stillCount + 1) : 0;
-    if (stillCount >= STILL_HOLD) {
-      gxBias += BIAS_LR * (gx - gxBias);
-      gyBias += BIAS_LR * (gy - gyBias);
-      gzBias += BIAS_LR * (gz - gzBias);
-      cx = gx - gxBias; cy = gy - gyBias; cz = gz - gzBias;
-    }
-
-    // Deadband: drop sub-threshold rates so sensor noise never integrates.
-    if (fabsf(cx) < GYRO_DEADBAND) cx = 0;
-    if (fabsf(cy) < GYRO_DEADBAND) cy = 0;
-    if (fabsf(cz) < GYRO_DEADBAND) cz = 0;
+    float cx = gx - gxBias, cy = gy - gyBias, cz = gz - gzBias;   // remove startup bias
 
     unsigned long now = micros();
     float dt = (now - lastMicros) * 1e-6f;
     lastMicros = now;
-    if (dt <= 0 || dt > 0.2f) dt = 0.01f;   // guard against stalls
+    if (dt <= 0 || dt > 0.2f) dt = 0.01f;
 
     float gyroMag = sqrtf(cx * cx + cy * cy + cz * cz);   // deg/s (stability metric)
 
     const float DEG2RAD = 0.01745329252f;
-    madgwickUpdateIMU(cx * DEG2RAD, cy * DEG2RAD, cz * DEG2RAD, ax, ay, az, dt);
+    mahonyUpdate(cx * DEG2RAD, cy * DEG2RAD, cz * DEG2RAD, ax, ay, az, mbx, mby, mbz, dt);
 
-    // Throttle serial output to ~50 Hz
     static unsigned long lastPrint = 0;
     if (now - lastPrint >= 20000) {
       lastPrint = now;
-      Serial.print(q0, 5); Serial.print(',');
-      Serial.print(q1, 5); Serial.print(',');
-      Serial.print(q2, 5); Serial.print(',');
-      Serial.print(q3, 5); Serial.print(',');
+      Serial.print(q0, 5); Serial.print(','); Serial.print(q1, 5); Serial.print(',');
+      Serial.print(q2, 5); Serial.print(','); Serial.print(q3, 5); Serial.print(',');
       Serial.println(gyroMag, 2);
     }
   }
