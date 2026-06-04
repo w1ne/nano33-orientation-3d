@@ -87,6 +87,33 @@ python3 bridge.py            # auto-detects the Arduino port
 #    http://localhost:8000   in Chrome
 ```
 
+## Running the visualization
+
+The visualization is served by `bridge.py` itself — there's no separate build or web
+server to start.
+
+1. **Start the bridge** (with the board plugged in):
+   ```bash
+   python3 bridge.py
+   ```
+   You should see `[serial] connected to /dev/ttyACMx`, `[http] serving … :8000`, and
+   `[ws] listening … :8765`.
+2. **Open** `http://localhost:8000` in a Chromium-based browser (Chrome, Edge, Brave).
+3. The status dot turns **green ("board connected")** and the 3D board model starts
+   mirroring the real board. The HUD shows roll / pitch / yaw, angular rate, and the
+   stability bar + sparkline.
+
+**Controls:** drag to orbit the camera · scroll to zoom · **double-click to re-zero yaw**.
+
+**Notes**
+- The page auto-connects to the bridge over WebSocket and **auto-reconnects** if the
+  bridge restarts or the board is replugged — no need to refresh.
+- If the dot stays red / "waiting for board…", the bridge isn't seeing the board: check
+  it's plugged in and that `python3 bridge.py` printed a `[serial] connected` line.
+- Only one program can hold the serial port at a time — stop other serial monitors (and
+  `arduino-cli` uploads) before/while running the bridge.
+- Ports/host are fixed in `bridge.py`: HTTP `8000`, WebSocket `8765`.
+
 ### Which IMU library?
 
 The Nano 33 BLE comes in two flavors with **different IMU chips** but the *same* USB name:
