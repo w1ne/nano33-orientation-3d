@@ -41,6 +41,11 @@ LSM9DS1 / BMI270 IMU  ──>  Madgwick fusion (on-board)  ──>  USB serial (
 > solid; yaw is relative and may drift slowly. Double-click the view to zero out yaw
 > drift. The magnetometer (present on both IMU variants) can be added for an absolute
 > compass heading once hard/soft-iron calibration is in place.
+>
+> **Gyro bias calibration:** on reset the sketch averages the gyro for ~2 s to measure
+> its zero-rate offset, so **keep the board still for the first couple of seconds after
+> flashing/reset**. Without this the raw ~0.5 °/s gyro bias integrates into runaway yaw
+> drift; with it the residual is ~0.1 °/s (the sensor noise floor).
 
 ## Quick start
 

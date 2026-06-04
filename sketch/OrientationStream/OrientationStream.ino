@@ -23,6 +23,9 @@ static float beta = 0.1f;                  // filter gain
 static float q0 = 1, q1 = 0, q2 = 0, q3 = 0;
 static unsigned long lastMicros = 0;
 
+// Gyro zero-rate bias (deg/s), measured at startup while the board is still.
+static float gxBias = 0, gyBias = 0, gzBias = 0;
+
 static float invSqrt(float x) { return 1.0f / sqrtf(x); }
 
 // 6-axis (gyro + accel) Madgwick update. gyro in rad/s, accel in any unit.
@@ -69,8 +72,28 @@ void setup() {
   while (!Serial && millis() < 4000) { /* wait briefly for host */ }
 
   if (!IMU.begin()) {
-    while (1) { Serial.println("ERR: LSM9DS1 init failed"); delay(1000); }
+    while (1) { Serial.println("ERR: IMU init failed"); delay(1000); }
   }
+
+  // --- Gyro bias calibration: keep the board still for ~2 s after reset ---
+  Serial.println("CAL: hold the board still...");
+  const int N = 800;
+  int got = 0;
+  float bx = 0, by = 0, bz = 0;
+  unsigned long t0 = millis();
+  while (got < N && millis() - t0 < 5000) {
+    if (IMU.gyroscopeAvailable()) {
+      float gx, gy, gz;
+      IMU.readGyroscope(gx, gy, gz);
+      bx += gx; by += gy; bz += gz; got++;
+    }
+  }
+  if (got > 0) { gxBias = bx / got; gyBias = by / got; gzBias = bz / got; }
+  Serial.print("CAL: done, bias deg/s = ");
+  Serial.print(gxBias, 3); Serial.print(',');
+  Serial.print(gyBias, 3); Serial.print(',');
+  Serial.println(gzBias, 3);
+
   lastMicros = micros();
 }
 
@@ -79,7 +102,11 @@ void loop() {
   bool haveA = false, haveG = false;
 
   if (IMU.accelerationAvailable()) { IMU.readAcceleration(ax, ay, az); haveA = true; }
-  if (IMU.gyroscopeAvailable())    { IMU.readGyroscope(gx, gy, gz);    haveG = true; }
+  if (IMU.gyroscopeAvailable())    {
+    IMU.readGyroscope(gx, gy, gz);
+    gx -= gxBias; gy -= gyBias; gz -= gzBias;   // remove zero-rate bias
+    haveG = true;
+  }
 
   if (haveA && haveG) {
     unsigned long now = micros();
