@@ -173,7 +173,9 @@ const smoothed = new THREE.Quaternion(0, 0, 0, 1);
 const corrected = new THREE.Quaternion();
 function tick() {
   corrected.copy(yawOffset).multiply(targetQ);
-  smoothed.slerp(corrected, 0.35);          // gentle smoothing for silky motion
+  // Adaptive smoothing: heavy when still (no jitter), light when moving (responsive).
+  const alpha = lastGyro < 3 ? 0.08 : 0.45;
+  smoothed.slerp(corrected, alpha);
   board.quaternion.copy(smoothed);
   updateHud(lastGyro);
   renderer.render(scene, camera);

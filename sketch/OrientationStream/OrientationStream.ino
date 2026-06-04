@@ -23,8 +23,15 @@ static float beta = 0.1f;                  // filter gain
 static float q0 = 1, q1 = 0, q2 = 0, q3 = 0;
 static unsigned long lastMicros = 0;
 
-// Gyro zero-rate bias (deg/s), measured at startup while the board is still.
+// Gyro zero-rate bias (deg/s): seeded at startup, then continuously re-learned
+// whenever the board is detected stationary (tracks temperature drift).
 static float gxBias = 0, gyBias = 0, gzBias = 0;
+
+// Stability tuning
+static const float GYRO_STILL    = 1.5f;   // deg/s below which we treat the board as not rotating
+static const float ACC_STILL     = 0.08f;  // g; accel within this of 1 g => no linear acceleration
+static const float BIAS_LR       = 0.003f; // learning rate for online gyro-bias tracking
+static const float GYRO_DEADBAND = 0.2f;   // deg/s; ignore rotation below this so noise can't integrate
 
 static float invSqrt(float x) { return 1.0f / sqrtf(x); }
 
@@ -102,22 +109,40 @@ void loop() {
   bool haveA = false, haveG = false;
 
   if (IMU.accelerationAvailable()) { IMU.readAcceleration(ax, ay, az); haveA = true; }
-  if (IMU.gyroscopeAvailable())    {
-    IMU.readGyroscope(gx, gy, gz);
-    gx -= gxBias; gy -= gyBias; gz -= gzBias;   // remove zero-rate bias
-    haveG = true;
-  }
+  if (IMU.gyroscopeAvailable())    { IMU.readGyroscope(gx, gy, gz); haveG = true; }
 
   if (haveA && haveG) {
+    // Bias-correct the gyro.
+    float cx = gx - gxBias, cy = gy - gyBias, cz = gz - gzBias;
+
+    // Stationary detection: little rotation AND accel ~ 1 g (no linear motion).
+    float accMag  = sqrtf(ax * ax + ay * ay + az * az);
+    float corrMag = sqrtf(cx * cx + cy * cy + cz * cz);
+    bool still = (corrMag < GYRO_STILL) && (fabsf(accMag - 1.0f) < ACC_STILL);
+
+    // While stationary, slowly retrain the bias toward the raw reading so it
+    // tracks temperature drift -- this is what keeps yaw from wandering.
+    if (still) {
+      gxBias += BIAS_LR * (gx - gxBias);
+      gyBias += BIAS_LR * (gy - gyBias);
+      gzBias += BIAS_LR * (gz - gzBias);
+      cx = gx - gxBias; cy = gy - gyBias; cz = gz - gzBias;
+    }
+
+    // Deadband: drop sub-threshold rates so sensor noise never integrates.
+    if (fabsf(cx) < GYRO_DEADBAND) cx = 0;
+    if (fabsf(cy) < GYRO_DEADBAND) cy = 0;
+    if (fabsf(cz) < GYRO_DEADBAND) cz = 0;
+
     unsigned long now = micros();
     float dt = (now - lastMicros) * 1e-6f;
     lastMicros = now;
     if (dt <= 0 || dt > 0.2f) dt = 0.01f;   // guard against stalls
 
-    float gyroMag = sqrtf(gx * gx + gy * gy + gz * gz);   // deg/s
+    float gyroMag = sqrtf(cx * cx + cy * cy + cz * cz);   // deg/s (stability metric)
 
     const float DEG2RAD = 0.01745329252f;
-    madgwickUpdateIMU(gx * DEG2RAD, gy * DEG2RAD, gz * DEG2RAD, ax, ay, az, dt);
+    madgwickUpdateIMU(cx * DEG2RAD, cy * DEG2RAD, cz * DEG2RAD, ax, ay, az, dt);
 
     // Throttle serial output to ~50 Hz
     static unsigned long lastPrint = 0;

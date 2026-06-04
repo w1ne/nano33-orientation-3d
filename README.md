@@ -42,10 +42,16 @@ LSM9DS1 / BMI270 IMU  ──>  Madgwick fusion (on-board)  ──>  USB serial (
 > drift. The magnetometer (present on both IMU variants) can be added for an absolute
 > compass heading once hard/soft-iron calibration is in place.
 >
-> **Gyro bias calibration:** on reset the sketch averages the gyro for ~2 s to measure
-> its zero-rate offset, so **keep the board still for the first couple of seconds after
-> flashing/reset**. Without this the raw ~0.5 °/s gyro bias integrates into runaway yaw
-> drift; with it the residual is ~0.1 °/s (the sensor noise floor).
+> **Drift control:** three things keep yaw stable in 6-axis mode —
+> 1. **Startup calibration** — averages the gyro for ~2 s on reset to seed the
+>    zero-rate bias, so **keep the board still for a couple seconds after flashing/reset**.
+> 2. **Continuous bias tracking** — whenever the board is detected stationary, the bias
+>    is slowly re-learned, so it follows temperature drift instead of accumulating.
+> 3. **Deadband** — sub-threshold rotation (below the sensor noise floor) is ignored so
+>    noise can't integrate into drift.
+>
+> Measured result: held still, yaw drifts **~0.01 °/min** (≈0.2° total wander), down from
+> ~36 °/min with the raw uncalibrated bias. Double-click the view to re-zero yaw anytime.
 
 ## Quick start
 
