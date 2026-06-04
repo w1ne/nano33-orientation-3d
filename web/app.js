@@ -173,8 +173,11 @@ const smoothed = new THREE.Quaternion(0, 0, 0, 1);
 const corrected = new THREE.Quaternion();
 function tick() {
   corrected.copy(yawOffset).multiply(targetQ);
-  // Adaptive smoothing: heavy when still (no jitter), light when moving (responsive).
-  const alpha = lastGyro < 3 ? 0.08 : 0.45;
+  // Error-based smoothing: catch up fast when far from target (so it never
+  // "crawls" after a fast move stops), smooth gently only once settled.
+  const dot = Math.min(1, Math.abs(smoothed.dot(corrected)));
+  const angle = 2 * Math.acos(dot);                 // radians between current & target
+  const alpha = Math.min(0.7, Math.max(0.15, angle * 4));
   smoothed.slerp(corrected, alpha);
   board.quaternion.copy(smoothed);
   updateHud(lastGyro);

@@ -28,10 +28,11 @@ static unsigned long lastMicros = 0;
 static float gxBias = 0, gyBias = 0, gzBias = 0;
 
 // Stability tuning
-static const float GYRO_STILL    = 1.5f;   // deg/s below which we treat the board as not rotating
-static const float ACC_STILL     = 0.08f;  // g; accel within this of 1 g => no linear acceleration
-static const float BIAS_LR       = 0.003f; // learning rate for online gyro-bias tracking
-static const float GYRO_DEADBAND = 0.2f;   // deg/s; ignore rotation below this so noise can't integrate
+static const float GYRO_STILL    = 0.8f;   // deg/s; strict gate so real motion isn't absorbed as bias
+static const float ACC_STILL     = 0.05f;  // g; accel within this of 1 g => no linear acceleration
+static const float BIAS_LR       = 0.02f;  // learning rate; fast re-converge once *truly* still
+static const int   STILL_HOLD    = 25;     // consecutive still samples required before trusting "still"
+static const float GYRO_DEADBAND = 0.4f;   // deg/s; ignore rotation below this so noise/residual bias can't integrate
 
 static float invSqrt(float x) { return 1.0f / sqrtf(x); }
 
@@ -120,9 +121,12 @@ void loop() {
     float corrMag = sqrtf(cx * cx + cy * cy + cz * cz);
     bool still = (corrMag < GYRO_STILL) && (fabsf(accMag - 1.0f) < ACC_STILL);
 
-    // While stationary, slowly retrain the bias toward the raw reading so it
-    // tracks temperature drift -- this is what keeps yaw from wandering.
-    if (still) {
+    // Require the board to be still for a sustained run before retraining the
+    // bias, so a slow handling motion can't be mistaken for "stationary" and
+    // absorbed into the bias (which would make it spin once you stop).
+    static int stillCount = 0;
+    stillCount = still ? (stillCount + 1) : 0;
+    if (stillCount >= STILL_HOLD) {
       gxBias += BIAS_LR * (gx - gxBias);
       gyBias += BIAS_LR * (gy - gyBias);
       gzBias += BIAS_LR * (gz - gzBias);
