@@ -1,66 +1,84 @@
 # Board Orientation
 
-Real-time 3D orientation tracking for an **Arduino Nano 33 BLE**, visualized live in the
-browser. The board's on-board IMU is fused into an orientation quaternion and a little 3D
-model of the board mirrors its real attitude — tilt the board, the model tilts with it.
+Real-time 3D orientation tracking for an **Arduino Nano 33 BLE Rev2** (BMI270 + BMM150),
+visualized live in the browser. The board's on-board sensors are fused into an orientation
+quaternion and a little 3D model mirrors the board's real attitude — tilt or spin the
+board, the model follows.
 
 ![demo](docs/demo.png)
 
 The panel shows live **roll / pitch / yaw**, the current angular **rate**, and a
-**stability** indicator (STEADY / MOVING / FAST) with a rolling sparkline — handy for
-seeing how steadily the board is being held.
+**stability** indicator (STEADY / MOVING / FAST) with a rolling sparkline.
 
 ## How it works
 
 ```
-LSM9DS1 / BMI270 IMU  ──>  Madgwick fusion (on-board)  ──>  USB serial (quaternion + rate)
-                                                                    │
-                                              bridge.py (serial → WebSocket + static files)
-                                                                    │
-                                              browser: Three.js 3D model + HUD (web/)
+BMI270 (accel+gyro) + BMM150 (mag)  ──>  9-axis Mahony fusion (on-board)
+                                                 │   quaternion + rate
+                                          USB serial (~50 Hz)
+                                                 │
+                          bridge.py (serial → WebSocket + static file server)
+                                                 │
+                          browser: Three.js 3D model + HUD (web/)
 ```
 
-1. **`sketch/OrientationStream`** reads the accelerometer + gyroscope and runs a
-   [Madgwick](https://x-io.co.uk/open-source-imu-and-ahrs-algorithms/) sensor-fusion
+1. **`sketch/OrientationStream`** reads the accelerometer, gyroscope **and magnetometer**
+   and runs a [Mahony](https://nitinjsanket.github.io/tutorials/attitudeest/mahony) AHRS
    filter *on the board*, streaming a unit quaternion `q0,q1,q2,q3` plus the gyro
    magnitude (a stability metric) over USB at ~50 Hz.
 2. **`bridge.py`** reads that serial stream, serves the web page, and forwards each
-   sample to the browser over a WebSocket.
+   sample to the browser over a WebSocket. It auto-detects the board's serial port and
+   re-detects it on reconnect, so the board can be replugged/moved without restarting.
 3. **`web/`** renders a 3D board model with Three.js and applies the quaternion every
    frame, plus the orientation/stability HUD.
 
+## Sensor fusion
+
+Full **9-axis fusion** (accelerometer + gyroscope + magnetometer), Mahony filter:
+
+- **Accelerometer** anchors **roll & pitch** to gravity — absolute, drift-free.
+- **Magnetometer** anchors **yaw** to the Earth's magnetic field — an absolute compass
+  heading, so yaw doesn't accumulate drift (a 6-axis gyro-only filter can't fix yaw,
+  because it has no absolute yaw reference).
+- **Mahony's integral term** continuously estimates and removes the gyroscope bias,
+  including the transient bias that appears right after a fast movement.
+
+**Gyro startup calibration:** on reset the sketch averages the gyro for ~2 s to seed the
+zero-rate bias — **keep the board still for a couple of seconds after flashing/reset.**
+
+**Magnetometer calibration (board-specific):** the BMM150's axes are *not* aligned with
+the BMI270's, and the library passes magnetometer data through raw. This sketch's mapping
+(`board_x=-my, board_y=+mx, board_z=+mz`) and hard-iron offsets were recovered empirically
+from a tumble capture and validated against gravity (the gravity↔field angle came out 23.4°,
+matching the local magnetic dip). If you use a different board or location, re-run the
+calibration — flash `sketch/RawStream`, tumble the board through all orientations, and
+recompute the offsets/mapping from the captured `mx,my,mz` vs `ax,ay,az`.
+
+> ⚠️ **The magnetometer needs a clean magnetic environment.** Near a laptop, motors,
+> speakers, magnets, or metal, the local field is distorted *and time-varying*, so the
+> compass heading wanders and yaw follows it — even while the board sits still. If yaw
+> drifts at rest, that's almost always local interference, not the filter. Measured on a
+> desk next to a laptop the field swung from 24–37 µT (it should be a steady ~50 µT), so
+> for trustworthy yaw run the board on battery / a long cable, ~0.5–1 m clear of
+> electronics and metal.
+
 ## What it can (and can't) do
 
-- ✅ **Orientation** (which way the board is tilted / pointing) — precise and stable.
-- ✅ **Motion / stability** (how much it's rotating right now).
+- ✅ **Orientation** — roll / pitch / yaw (which way the board is tilted and pointing).
+- ✅ **Motion / stability** — how fast it's rotating right now.
 - ❌ **Absolute XYZ position** — *not possible* from an IMU alone; integrating
   acceleration drifts to nonsense within seconds. Position needs external reference
   hardware (camera, UWB, etc.).
-
-> 6-axis fusion (gyro + accel) is used by default: roll & pitch are absolute and rock
-> solid; yaw is relative and may drift slowly. Double-click the view to zero out yaw
-> drift. The magnetometer (present on both IMU variants) can be added for an absolute
-> compass heading once hard/soft-iron calibration is in place.
->
-> **Drift control:** three things keep yaw stable in 6-axis mode —
-> 1. **Startup calibration** — averages the gyro for ~2 s on reset to seed the
->    zero-rate bias, so **keep the board still for a couple seconds after flashing/reset**.
-> 2. **Continuous bias tracking** — whenever the board is detected stationary, the bias
->    is slowly re-learned, so it follows temperature drift instead of accumulating.
-> 3. **Deadband** — sub-threshold rotation (below the sensor noise floor) is ignored so
->    noise can't integrate into drift.
->
-> Measured result: held still, yaw drifts **~0.01 °/min** (≈0.2° total wander), down from
-> ~36 °/min with the raw uncalibrated bias. Double-click the view to re-zero yaw anytime.
 
 ## Quick start
 
 ```bash
 # 1. Flash the board (needs arduino-cli + the mbed_nano core)
 arduino-cli core install arduino:mbed_nano
-arduino-cli lib install Arduino_BMI270_BMM150   # or Arduino_LSM9DS1 — see note below
+arduino-cli lib install Arduino_BMI270_BMM150     # Rev2 IMU; see note below for rev1
 arduino-cli compile --fqbn arduino:mbed_nano:nano33ble sketch/OrientationStream
 arduino-cli upload  --fqbn arduino:mbed_nano:nano33ble -p /dev/ttyACM0 sketch/OrientationStream
+# keep the board still for ~2 s after upload (gyro calibration)
 
 # 2. Run the bridge (Python 3 + pyserial + websockets)
 python3 bridge.py            # auto-detects the Arduino port
@@ -78,22 +96,25 @@ The Nano 33 BLE comes in two flavors with **different IMU chips** but the *same*
 | Nano 33 BLE (rev1) / Sense | LSM9DS1 | `Arduino_LSM9DS1` | `0x6B`, `0x1E` |
 | Nano 33 BLE Rev2 / Sense Rev2 | BMI270 + BMM150 | `Arduino_BMI270_BMM150` | `0x68`, `0x10` |
 
-Both expose the identical `IMU.*` API, so only the `#include` differs. If `IMU.begin()`
-fails, you have the other variant — flash `sketch/I2CScan` to see which addresses respond
-and switch the include accordingly. (This repo's sketch is set up for the **Rev2 / BMI270**.)
+Both expose the identical `IMU.*` API. If `IMU.begin()` fails you likely have the other
+variant — flash `sketch/I2CScan` to see which I2C addresses respond and switch the
+`#include` accordingly. This repo's sketch targets the **Rev2 (BMI270 + BMM150)**; the
+magnetometer axis mapping above is specific to that board.
 
 ## Repo layout
 
 ```
-sketch/OrientationStream/   Arduino sketch: IMU + on-board Madgwick fusion, streams quaternion
-sketch/I2CScan/             Utility: identify which IMU chip is fitted
-bridge.py                   Serial → WebSocket bridge + static file server
+sketch/OrientationStream/   Arduino sketch: 9-axis Mahony fusion, streams quaternion + rate
+sketch/I2CScan/             Utility: identify which IMU chip is fitted (scans I2C)
+sketch/RawStream/           Utility: dump raw accel/gyro/mag for calibration & diagnostics
+bridge.py                   Serial → WebSocket bridge + static file server (auto-reconnect)
+diag_capture.py             Records orientation over the WebSocket to analyze drift/recovery
 web/                        Three.js 3D visualization (index.html, app.js, three.module.min.js)
 ```
 
 ## Requirements
 
-- Arduino Nano 33 BLE (either IMU variant)
+- Arduino Nano 33 BLE (Rev2 / BMI270 + BMM150 for the 9-axis magnetometer path)
 - [`arduino-cli`](https://arduino.github.io/arduino-cli/) with the `arduino:mbed_nano` core
 - Python 3 with `pyserial` and `websockets`
 - A Chromium-based browser
